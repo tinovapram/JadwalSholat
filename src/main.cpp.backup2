@@ -1,0 +1,913 @@
+/*
+ * ESP32 BT-WiFi Controller with Prayer Times - Main Module
+ * Enhanced modular design with optimized features:
+ * - SD card prioritization for prayer times
+ * - Timezone-aware NTP synchronization
+ * - 7-day ahead prayer times caching
+ * - Numbered menu system
+ * - First boot WiFi setup handling
+ */
+
+#include "global.h"
+
+// Global objects (defined here)
+BluetoothSerial SerialBT;
+RTC_DS3231 rtc;
+Preferences preferences;
+HTTPClient http;
+
+// Global variables - WiFi Management
+String savedSSID = "";
+String savedPassword = "";
+String currentCity = DEFAULT_CITY;
+String currentTimezone = DEFAULT_TIMEZONE;
+int timezoneOffset = DEFAULT_TIMEZONE_OFFSET;
+bool wifiConnected = false;
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastRetryReset = 0;
+unsigned long lastWiFiCheck = 0;
+int reconnectRetries = 0;
+int wifiNetworkCount = 0;
+String wifiNetworks[MAX_NETWORKS];
+int wifiRSSI[MAX_NETWORKS];
+bool wifiSecurity[MAX_NETWORKS];
+
+// Global variables - System Status
+bool bluetoothConnected = false;
+bool rtcInitialized = false;
+bool sdCardInitialized = false;
+String lastCommand = "";
+unsigned long commandTimeout = 0;
+bool waitingForInput = false;
+bool isFirstBoot = false;
+String inputPrompt = "";
+
+// Function declarations
+void initializeSystem();
+void checkFirstBoot();
+void handleFirstBootSetup();
+void processBluetoothCommands();
+void handleBluetoothCommand(const String& command);
+void handleMenuSelection(int selection);
+void showMainMenu();
+void showStatus();
+void showHelp();
+void restartDevice();
+bool connectToWiFi(const String& ssid, const String& password);
+
+void setup() {
+  Serial.begin(SERIAL_BAUD_RATE);
+  debugPrintln("\n=== ESP32 Prayer Times Controller Starting ===");
+  
+  initializeSystem();
+  checkFirstBoot();
+  
+  if (isFirstBoot) {
+    handleFirstBootSetup();
+  } else {
+    loadWiFiCredentials();
+    
+    if (savedSSID.length() > 0) {
+      debugPrintln("Found saved WiFi credentials, attempting to connect...");
+      connectToWiFi(savedSSID, savedPassword);
+      
+      if (wifiConnected) {
+        syncTimeWithNTP();
+        fetchPrayerTimes();
+      }
+    } else {
+      SerialBT.println("No WiFi configured. Select option 2 from menu to configure WiFi.");
+    }
+  }
+  
+  showMainMenu();
+}
+
+void loop() {
+  // Check WiFi connection status
+  if (millis() - lastWiFiCheck > WIFI_CHECK_INTERVAL) {
+    checkWiFiConnection();
+    lastWiFiCheck = millis();
+  }
+  
+  // Handle auto-reconnection
+  if (!wifiConnected && savedSSID.length() > 0 && !isFirstBoot) {
+    autoReconnectWiFi();
+  }
+  
+  // Reset retry counter every 5 minutes
+  if (millis() - lastRetryReset > RETRY_RESET_INTERVAL) {
+    reconnectRetries = 0;
+    lastRetryReset = millis();
+    debugPrintln("Retry counter reset");
+  }
+  
+  // Process Bluetooth commands
+  processBluetoothCommands();
+  
+  // Check command timeout
+  if (waitingForInput && millis() - commandTimeout > BT_TIMEOUT) {
+    waitingForInput = false;
+    SerialBT.println("Command timeout. Select option 1 to see menu again.");
+    inputPrompt = "";
+  }
+  
+  delay(100);
+}
+
+void initializeSystem() {
+  debugPrintln("Initializing system components...");
+  
+  // Initialize Preferences
+  preferences.begin("wifi-creds", false);
+  
+  // Initialize Bluetooth
+  SerialBT.begin(BT_DEVICE_NAME);
+  bluetoothConnected = true;
+  debugPrintln("Bluetooth initialized as '" + String(BT_DEVICE_NAME) + "'");
+  
+  // Initialize I2C for RTC
+  Wire.begin();
+  initializeRTC();
+  
+  // Initialize SD Card
+  initializeSDCard();
+  
+  // Set WiFi mode
+  WiFi.mode(WIFI_STA);
+  
+  debugPrintln("System initialization complete");
+}
+
+void checkFirstBoot() {
+  // Check if this is first boot by looking for saved credentials and RTC status
+  String ssid = preferences.getString("ssid", "");
+  bool hasCredentials = (ssid.length() > 0);
+  bool rtcNeedsSync = false;
+  
+  if (rtcInitialized) {
+    rtcNeedsSync = rtc.lostPower();
+  } else {
+    rtcNeedsSync = true;
+  }
+  
+  // Consider it first boot if no WiFi credentials OR RTC needs setup
+  isFirstBoot = (!hasCredentials || rtcNeedsSync);
+  
+  if (isFirstBoot) {
+    debugPrintln("First boot detected - needs setup");
+  } else {
+    debugPrintln("Normal boot - configuration exists");
+  }
+}
+
+void handleFirstBootSetup() {
+  SerialBT.println("\n=== FIRST BOOT SETUP ===");
+  SerialBT.println("Welcome to ESP32 Prayer Times Controller!");
+  SerialBT.println("This appears to be your first boot or the device needs setup.");
+  SerialBT.println("");
+  
+  if (!rtcInitialized || rtc.lostPower()) {
+    SerialBT.println("⚠️  RTC needs time synchronization");
+  }
+  
+  if (savedSSID.length() == 0) {
+    SerialBT.println("⚠️  WiFi credentials not configured");
+  }
+  
+  SerialBT.println("");
+  SerialBT.println("To complete setup:");
+  SerialBT.println("1. Connect to WiFi (option 2 from main menu)");
+  SerialBT.println("2. Time will be synchronized automatically");
+  SerialBT.println("3. Prayer times will be downloaded & cached for 7 days");
+  SerialBT.println("");
+  SerialBT.println("Please select option 2 to configure WiFi first.");
+  SerialBT.println("========================");
+}
+
+
+void initializeRTC() {
+  if (rtc.begin()) {
+    rtcInitialized = true;
+    debugPrintln("RTC DS3231 initialized successfully");
+    
+    if (rtc.lostPower()) {
+      debugPrintln("RTC lost power, will sync with NTP when WiFi connects");
+    }
+  } else {
+    rtcInitialized = false;
+    debugPrintln("ERROR: Could not initialize RTC DS3231");
+  }
+}
+
+void loadWiFiCredentials() {
+  savedSSID = preferences.getString("ssid", "");
+  savedPassword = preferences.getString("password", "");
+  currentCity = preferences.getString("city", "Nganjuk");
+  currentTimezone = preferences.getString("timezone", "Asia/Jakarta");
+  timezoneOffset = preferences.getInt("tz_offset", 7);
+  
+  if (savedSSID.length() > 0) {
+    debugPrintln("Loaded WiFi credentials from flash: " + savedSSID);
+    debugPrintln("Current city: " + currentCity);
+    debugPrintln("Current timezone: " + currentTimezone + " (GMT+" + String(timezoneOffset) + ")");
+  }
+}
+
+void saveWiFiCredentials(const String& ssid, const String& password) {
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+  savedSSID = ssid;
+  savedPassword = password;
+  debugPrintln("WiFi credentials saved to flash");
+}
+
+void clearWiFiCredentials() {
+  preferences.clear();
+  savedSSID = "";
+  savedPassword = "";
+  debugPrintln("WiFi credentials cleared from flash");
+}
+
+bool connectToWiFi(const String& ssid, const String& password) {
+  debugPrintln("Attempting to connect to WiFi: " + ssid);
+  SerialBT.println("Connecting to " + ssid + "...");
+  
+  WiFi.begin(ssid.c_str(), password.c_str());
+  
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < WIFI_TIMEOUT) {
+    delay(500);
+    SerialBT.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    reconnectRetries = 0;
+    SerialBT.println("\nWiFi connected successfully!");
+    SerialBT.println("IP Address: " + WiFi.localIP().toString());
+    debugPrintln("WiFi connected. IP: " + WiFi.localIP().toString());
+    return true;
+  } else {
+    wifiConnected = false;
+    SerialBT.println("\nFailed to connect to WiFi");
+    debugPrintln("WiFi connection failed");
+    return false;
+  }
+}
+
+void scanWiFiNetworks() {
+  SerialBT.println("Scanning for WiFi networks...");
+  debugPrintln("Starting WiFi scan");
+  
+  wifiNetworkCount = WiFi.scanNetworks();
+  
+  if (wifiNetworkCount == 0) {
+    SerialBT.println("No networks found");
+    return;
+  }
+  
+  // Store network information
+  int displayCount = min(wifiNetworkCount, MAX_NETWORKS);
+  for (int i = 0; i < displayCount; i++) {
+    wifiNetworks[i] = WiFi.SSID(i);
+    wifiRSSI[i] = WiFi.RSSI(i);
+    wifiSecurity[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+  }
+  
+  wifiNetworkCount = displayCount;
+  debugPrintln("Found " + String(wifiNetworkCount) + " networks");
+}
+
+void displayWiFiNetworks() {
+  if (wifiNetworkCount == 0) {
+    SerialBT.println("No networks available. Use 'scan' to search for networks.");
+    return;
+  }
+  
+  SerialBT.println("\n=== Available WiFi Networks ===");
+  
+  for (int i = 0; i < wifiNetworkCount; i++) {
+    SerialBT.println(String(i + 1) + ". " + wifiNetworks[i]);
+    SerialBT.println("   Security: " + getSecurityType(wifiSecurity[i]) + 
+                     " | Signal: " + getSignalStrength(wifiRSSI[i]) + 
+                     " (" + String(wifiRSSI[i]) + " dBm)");
+    SerialBT.println();
+  }
+  
+  SerialBT.println("================================");
+}
+
+void checkWiFiConnection() {
+  bool currentStatus = (WiFi.status() == WL_CONNECTED);
+  
+  if (currentStatus != wifiConnected) {
+    wifiConnected = currentStatus;
+    if (wifiConnected) {
+      debugPrintln("WiFi reconnected");
+      SerialBT.println("WiFi reconnected!");
+      reconnectRetries = 0;
+    } else {
+      debugPrintln("WiFi disconnected");
+      SerialBT.println("WiFi connection lost");
+    }
+  }
+}
+
+void autoReconnectWiFi() {
+  if (reconnectRetries >= MAX_RETRIES) {
+    return; // Max retries reached, wait for reset
+  }
+  
+  if (millis() - lastReconnectAttempt < RECONNECT_INTERVAL) {
+    return; // Too soon to retry
+  }
+  
+  lastReconnectAttempt = millis();
+  reconnectRetries++;
+  
+  debugPrintln("Auto-reconnect attempt " + String(reconnectRetries) + "/" + String(MAX_RETRIES));
+  connectToWiFi(savedSSID, savedPassword);
+}
+
+void fetchPrayerTimes() {
+  if (!wifiConnected) {
+    SerialBT.println("WiFi not connected. Cannot fetch prayer times.");
+    return;
+  }
+  
+  SerialBT.println("Fetching prayer times for " + currentCity + "...");
+  debugPrintln("Fetching prayer times for " + currentCity);
+  
+  // Get current date for API call
+  String currentDate = "";
+  if (rtcInitialized) {
+    DateTime now = rtc.now();
+    char dateStr[12];
+    sprintf(dateStr, "%02d-%02d-%04d", now.day(), now.month(), now.year());
+    currentDate = String(dateStr);
+  } else {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char dateStr[12];
+      sprintf(dateStr, "%02d-%02d-%04d", timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+      currentDate = String(dateStr);
+    } else {
+      // Fallback to today's date
+      currentDate = "27-09-2025";
+    }
+  }
+  
+  String url = "http://api.aladhan.com/v1/timingsByCity/" + currentDate + "?city=" + currentCity + 
+               "&country=Indonesia&method=20";
+  
+  debugPrintln("API URL: " + url);
+  
+  http.begin(url);
+  http.setTimeout(10000);
+  
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    displayPrayerTimes(payload);
+    debugPrintln("Prayer times fetched successfully");
+  } else {
+    SerialBT.println("Failed to fetch prayer times. HTTP code: " + String(httpCode));
+    debugPrintln("HTTP request failed: " + String(httpCode));
+    debugPrintln("URL used: " + url);
+  }
+
+  http.end();
+}
+
+void initializeSDCard() {
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  
+  if (SD.begin(SD_CS_PIN)) {
+    sdCardInitialized = true;
+    debugPrintln("SD Card initialized successfully");
+    
+    // Check card type
+    uint8_t cardType = SD.cardType();
+    if (cardType != CARD_NONE) {
+      uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+      debugPrintln("SD Card Size: " + String((uint32_t)cardSize) + " MB");
+      SerialBT.println("SD Card ready (" + String((uint32_t)cardSize) + " MB)");
+    }
+  } else {
+    sdCardInitialized = false;
+    debugPrintln("ERROR: Could not initialize SD Card");
+    SerialBT.println("SD Card initialization failed");
+  }
+}
+
+String createSDCardPath(const String& city, const String& date) {
+  // Extract year, month, day from date (format: DD-MM-YYYY)
+  int firstDash = date.indexOf('-');
+  int secondDash = date.lastIndexOf('-');
+  
+  String day = date.substring(0, firstDash);
+  String month = date.substring(firstDash + 1, secondDash);
+  String year = date.substring(secondDash + 1);
+  
+  String path = "/" + city + "/" + year + "/" + month;
+  return path;
+}
+
+void savePrayerTimesToSD(const String& jsonResponse) {
+  if (!sdCardInitialized) {
+    debugPrintln("SD Card not available for saving");
+    return;
+  }
+  
+  // Parse date from JSON to create proper path
+  JsonDocument tempDoc;
+  deserializeJson(tempDoc, jsonResponse);
+  JsonObject data = tempDoc["data"];
+  JsonObject date = data["date"];
+  JsonObject gregorian = date["gregorian"];
+  
+  String dateStr = gregorian["date"]; // Format: DD-MM-YYYY
+  String path = createSDCardPath(currentCity, dateStr);
+  
+  debugPrintln("Creating SD card path: " + path);
+  
+  // Create directory structure
+  if (!SD.exists(path)) {
+    String currentPath = "";
+    int start = 1; // Skip the leading slash
+    int slashIndex;
+    
+    while ((slashIndex = path.indexOf('/', start)) != -1) {
+      currentPath += "/" + path.substring(start, slashIndex);
+      if (!SD.exists(currentPath)) {
+        if (!SD.mkdir(currentPath)) {
+          debugPrintln("Failed to create directory: " + currentPath);
+          return;
+        }
+        debugPrintln("Created directory: " + currentPath);
+      }
+      start = slashIndex + 1;
+    }
+    
+    currentPath = path;
+    if (!SD.exists(currentPath)) {
+      if (!SD.mkdir(currentPath)) {
+        debugPrintln("Failed to create final directory: " + currentPath);
+        return;
+      }
+      debugPrintln("Created directory: " + currentPath);
+    }
+  }
+  
+  // Create filename with date
+  String day = dateStr.substring(0, dateStr.indexOf('-'));
+  String filename = path + "/" + day + ".json";
+  
+  debugPrintln("Saving prayer times to: " + filename);
+  
+  // Write JSON file
+  File file = SD.open(filename, FILE_WRITE);
+  if (file) {
+    file.print(jsonResponse);
+    file.close();
+    debugPrintln("Prayer times saved successfully to SD card");
+    SerialBT.println("Prayer times saved to SD card: " + filename);
+  } else {
+    debugPrintln("Failed to write to SD card file: " + filename);
+    SerialBT.println("Failed to save prayer times to SD card");
+  }
+}
+
+String getTimezoneAbbreviation(int offset) {
+  switch(offset) {
+    case 7: return "WIB";
+    case 8: return "WITA";
+    case 9: return "WIT";
+    default: return "WIB";
+  }
+}
+
+void displayPrayerTimes(const String& jsonResponse) {
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, jsonResponse);
+  
+  if (error) {
+    SerialBT.println("Error parsing prayer times data");
+    debugPrintln("JSON parsing error: " + String(error.c_str()));
+    return;
+  }
+  
+  JsonObject data = doc["data"];
+  JsonObject timings = data["timings"];
+  JsonObject date = data["date"];
+  JsonObject meta = data["meta"];
+  
+  String readable = date["readable"];
+  
+  // Extract timezone from API response
+  if (meta["timezone"].is<JsonVariant>()) {
+    String apiTimezone = meta["timezone"].as<String>();
+    debugPrintln("API returned timezone: " + apiTimezone);
+    
+    // Update timezone based on API response
+    if (apiTimezone != currentTimezone) {
+      currentTimezone = apiTimezone;
+      
+      // Determine offset based on timezone
+      if (apiTimezone == "Asia/Jakarta") {
+        timezoneOffset = 7; // WIB
+      } else if (apiTimezone == "Asia/Makassar") {
+        timezoneOffset = 8; // WITA
+      } else if (apiTimezone == "Asia/Jayapura") {
+        timezoneOffset = 9; // WIT
+      } else {
+        // Default to WIB if unknown timezone
+        timezoneOffset = 7;
+        debugPrintln("Unknown timezone from API, defaulting to GMT+7");
+      }
+      
+      debugPrintln("Timezone updated to: " + currentTimezone + " (GMT+" + String(timezoneOffset) + ")");
+      
+      // Save timezone to preferences
+      preferences.putString("timezone", currentTimezone);
+      preferences.putInt("tz_offset", timezoneOffset);
+      
+      // Re-sync time with new timezone
+      syncTimeWithNTP(timezoneOffset, currentTimezone);
+    }
+  }
+  
+  String tzAbbr = getTimezoneAbbreviation(timezoneOffset);
+  
+  SerialBT.println("\n=== Prayer Times for " + currentCity + " ===");
+  SerialBT.println("Date: " + readable);
+  SerialBT.println("Timezone: " + tzAbbr + " (GMT+" + String(timezoneOffset) + ")");
+  SerialBT.println("Fajr    : " + String((const char*)timings["Fajr"]) + " " + tzAbbr);
+  SerialBT.println("Dhuhr   : " + String((const char*)timings["Dhuhr"]) + " " + tzAbbr);
+  SerialBT.println("Asr     : " + String((const char*)timings["Asr"]) + " " + tzAbbr);
+  SerialBT.println("Maghrib : " + String((const char*)timings["Maghrib"]) + " " + tzAbbr);
+  SerialBT.println("Isha    : " + String((const char*)timings["Isha"]) + " " + tzAbbr);
+  SerialBT.println("================================\n");
+  
+  // Save prayer times to SD card
+  if (sdCardInitialized) {
+    savePrayerTimesToSD(jsonResponse);
+  }
+}
+
+void processBluetoothCommands() {
+  if (!SerialBT.available()) return;
+  
+  String input = SerialBT.readString();
+  input.trim();
+  
+  if (input.length() == 0) return;
+  
+  debugPrintln("Received command: " + input);
+  
+  // Handle different input contexts
+  if (waitingForInput) {
+    if (inputPrompt == "network_selection") {
+      int networkNum = input.toInt();
+      if (networkNum >= 1 && networkNum <= wifiNetworkCount) {
+        String selectedSSID = wifiNetworks[networkNum - 1];
+        SerialBT.println("Selected: " + selectedSSID);
+        
+        if (wifiSecurity[networkNum - 1]) {
+          // Open network
+          connectToWiFi(selectedSSID, "");
+          if (wifiConnected) {
+            saveWiFiCredentials(selectedSSID, "");
+          }
+          waitingForInput = false;
+          inputPrompt = "";
+        } else {
+          // Secured network - ask for password
+          SerialBT.println("Enter password for " + selectedSSID + ":");
+          inputPrompt = "password:" + selectedSSID;
+          commandTimeout = millis();
+        }
+      } else {
+        SerialBT.println("Invalid selection. Enter number 1-" + String(wifiNetworkCount));
+      }
+    } else if (inputPrompt.startsWith("password:")) {
+      String selectedSSID = inputPrompt.substring(9);
+      String password = input;
+      
+      SerialBT.println("Connecting to " + selectedSSID + "...");
+      connectToWiFi(selectedSSID, password);
+      
+      if (wifiConnected) {
+        saveWiFiCredentials(selectedSSID, password);
+        syncTimeWithNTP();
+        fetchPrayerTimes();
+      }
+      
+      waitingForInput = false;
+      inputPrompt = "";
+    } else if (inputPrompt == "city_name") {
+      currentCity = input;
+      preferences.putString("city", currentCity);
+      SerialBT.println("City changed to: " + currentCity);
+      fetchPrayerTimes();
+      waitingForInput = false;
+      inputPrompt = "";
+    }
+  } else {
+    handleBluetoothCommand(input);
+  }
+}
+
+void handleBluetoothCommand(const String& command) {
+  String cmd = command;
+  cmd.toLowerCase(); // Convert command to lowercase for comparison
+  lastCommand = cmd;
+  commandTimeout = millis();
+  
+  // Check if input is a number (menu selection)
+  if (cmd.length() <= 2 && cmd.toInt() >= 1 && cmd.toInt() <= 13) {
+    handleMenuSelection(cmd.toInt());
+    return;
+  }
+  
+  // Handle text commands (legacy support)
+  if (cmd == "menu" || cmd == "1") {
+    showMenu();
+  } else if (command == "status" || cmd == "2") {
+    showStatus();
+  } else if (command == "setup" || command == "wifi" || cmd == "3") {
+    scanWiFiNetworks();
+    displayWiFiNetworks();
+    if (wifiNetworkCount > 0) {
+      SerialBT.println("Enter network number (1-" + String(wifiNetworkCount) + "):");
+      waitingForInput = true;
+      inputPrompt = "network_selection";
+      commandTimeout = millis();
+    }
+  } else if (command == "scan" || cmd == "4") {
+    scanWiFiNetworks();
+    displayWiFiNetworks();
+  } else if (command == "connect" || cmd == "5") {
+    if (savedSSID.length() > 0) {
+      connectToWiFi(savedSSID, savedPassword);
+      if (wifiConnected) {
+        syncTimeWithNTP();
+        fetchPrayerTimes();
+      }
+    } else {
+      SerialBT.println("No saved credentials. Use option 3 to configure WiFi.");
+    }
+  } else if (command == "disconnect" || cmd == "6") {
+    WiFi.disconnect();
+    wifiConnected = false;
+    SerialBT.println("Disconnected from WiFi");
+    debugPrintln("WiFi manually disconnected");
+  } else if (command == "forget" || cmd == "7") {
+    WiFi.disconnect();
+    clearWiFiCredentials();
+    wifiConnected = false;
+    SerialBT.println("WiFi credentials forgotten");
+  } else if (command == "prayer" || cmd == "8") {
+    fetchPrayerTimes();
+  } else if (command == "time" || cmd == "9") {
+    showTime();
+  } else if (command == "city" || cmd == "10") {
+    SerialBT.println("Current city: " + currentCity);
+    SerialBT.println("Enter new city name (or press enter to keep current):");
+    waitingForInput = true;
+    inputPrompt = "city_name";
+    commandTimeout = millis();
+  } else if (command == "synctime" || cmd == "11") {
+    syncTimeWithNTP();
+  } else if (cmd == "restart" || cmd == "12") {
+    restartDevice();
+  } else if (cmd == "help" || cmd == "13") {
+    showHelp();
+  } else {
+    SerialBT.println("Unknown command: " + command);
+    SerialBT.println("Type '1' for menu or '13' for help");
+  }
+}
+
+void handleMenuSelection(int selection) {
+  switch (selection) {
+    case 1:
+      showMenu();
+      break;
+    case 2:
+      showStatus();
+      break;
+    case 3:
+      scanWiFiNetworks();
+      displayWiFiNetworks();
+      if (wifiNetworkCount > 0) {
+        SerialBT.println("Enter network number (1-" + String(wifiNetworkCount) + "):");
+        waitingForInput = true;
+        inputPrompt = "network_selection";
+        commandTimeout = millis();
+      }
+      break;
+    case 4:
+      scanWiFiNetworks();
+      displayWiFiNetworks();
+      break;
+    case 5:
+      if (savedSSID.length() > 0) {
+        connectToWiFi(savedSSID, savedPassword);
+        if (wifiConnected) {
+          syncTimeWithNTP();
+          fetchPrayerTimes();
+        }
+      } else {
+        SerialBT.println("No saved credentials. Use option 3 to configure WiFi.");
+      }
+      break;
+    case 6:
+      WiFi.disconnect();
+      wifiConnected = false;
+      SerialBT.println("Disconnected from WiFi");
+      debugPrintln("WiFi manually disconnected");
+      break;
+    case 7:
+      WiFi.disconnect();
+      clearWiFiCredentials();
+      wifiConnected = false;
+      SerialBT.println("WiFi credentials forgotten");
+      break;
+    case 8:
+      fetchPrayerTimes();
+      break;
+    case 9:
+      showTime();
+      break;
+    case 10:
+      SerialBT.println("Current city: " + currentCity);
+      SerialBT.println("Enter new city name (or press enter to keep current):");
+      waitingForInput = true;
+      inputPrompt = "city_name";
+      commandTimeout = millis();
+      break;
+    case 11:
+      syncTimeWithNTP();
+      break;
+    case 12:
+      restartDevice();
+      break;
+    case 13:
+      showHelp();
+      break;
+    default:
+      SerialBT.println("Invalid selection. Please choose 1-13.");
+      SerialBT.println("Type '1' for menu.");
+      break;
+  }
+}
+
+void showMenu() {
+  SerialBT.println("\n=== ESP32 Prayer Times Controller ===");
+  SerialBT.println("Select an option (1-13):");
+  SerialBT.println("1.  Show this menu");
+  SerialBT.println("2.  Show system status");
+  SerialBT.println("3.  Setup WiFi connection");
+  SerialBT.println("4.  Scan WiFi networks");
+  SerialBT.println("5.  Connect using saved WiFi");
+  SerialBT.println("6.  Disconnect from WiFi");
+  SerialBT.println("7.  Forget saved WiFi");
+  SerialBT.println("8.  Show prayer times");
+  SerialBT.println("9.  Show current time");
+  SerialBT.println("10. Change city");
+  SerialBT.println("11. Sync time with NTP");
+  SerialBT.println("12. Restart device");
+  SerialBT.println("13. Show detailed help");
+  SerialBT.println("====================================");
+  SerialBT.println("Enter your choice (1-13):\n");
+}
+
+void showStatus() {
+  SerialBT.println("\n=== System Status ===");
+  
+  // WiFi Status
+  SerialBT.print("WiFi Status: ");
+  SerialBT.println(wifiConnected ? "Connected" : "Disconnected");
+  if (wifiConnected) {
+    SerialBT.println("SSID: " + WiFi.SSID());
+    SerialBT.println("IP Address: " + WiFi.localIP().toString());
+    SerialBT.println("Signal Strength: " + getSignalStrength(WiFi.RSSI()) + 
+                     " (" + String(WiFi.RSSI()) + " dBm)");
+  } else if (savedSSID.length() > 0) {
+    SerialBT.println("Saved SSID: " + savedSSID);
+    SerialBT.println("Reconnect attempts: " + String(reconnectRetries) + "/" + String(MAX_RETRIES));
+  }
+  
+  // Bluetooth Status
+  SerialBT.println("Bluetooth: Active (Jadwal sholat)");
+  
+  // RTC Status
+  SerialBT.print("RTC DS3231: ");
+  SerialBT.println(rtcInitialized ? "Connected" : "Not found");
+  
+  // SD Card Status
+  SerialBT.print("SD Card: ");
+  if (sdCardInitialized) {
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    SerialBT.println("Connected (" + String((uint32_t)cardSize) + " MB)");
+  } else {
+    SerialBT.println("Not found");
+  }
+  
+  // Memory Status
+  SerialBT.println("Free Heap: " + String(ESP.getFreeHeap()) + " bytes");
+  SerialBT.println("Flash Size: " + String(ESP.getFlashChipSize() / 1024 / 1024) + " MB");
+  
+  // Uptime
+  unsigned long uptime = millis() / 1000;
+  unsigned long hours = uptime / 3600;
+  unsigned long minutes = (uptime % 3600) / 60;
+  unsigned long seconds = uptime % 60;
+  SerialBT.println("Uptime: " + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s");
+  
+  // Current City
+  SerialBT.println("Current City: " + currentCity);
+  
+  SerialBT.println("====================\n");
+}
+
+void showTime() {
+  String timeStr = getCurrentTime();
+  SerialBT.println("Current Time: " + timeStr);
+}
+
+void showHelp() {
+  SerialBT.println("\n=== Command Help ===");
+  SerialBT.println("You can use numbers (1-13) or text commands:");
+  SerialBT.println("");
+  SerialBT.println("1  or 'menu'      - Show main menu");
+  SerialBT.println("2  or 'status'    - WiFi/BT status, IP, signal, memory");
+  SerialBT.println("3  or 'setup'     - Start WiFi setup with network scanning");
+  SerialBT.println("4  or 'scan'      - Rescan WiFi networks with numbered list");
+  SerialBT.println("5  or 'connect'   - Reconnect using saved credentials");
+  SerialBT.println("6  or 'disconnect'- Disconnect from WiFi");
+  SerialBT.println("7  or 'forget'    - Clear saved WiFi credentials");
+  SerialBT.println("8  or 'prayer'    - Display today's prayer times");
+  SerialBT.println("9  or 'time'      - Show current time from RTC");
+  SerialBT.println("10 or 'city'      - Change city for prayer times");
+  SerialBT.println("11 or 'synctime'  - Force NTP time sync and update RTC");
+  SerialBT.println("12 or 'restart'   - Reboot ESP32");
+  SerialBT.println("13 or 'help'      - Show this help");
+  SerialBT.println("");
+  SerialBT.println("TIP: Simply enter a number (1-13) for quick access!");
+  SerialBT.println("====================\n");
+}
+
+void restartDevice() {
+  SerialBT.println("Restarting device in 3 seconds...");
+  debugPrintln("Device restart requested");
+  delay(3000);
+  ESP.restart();
+}
+
+String getSignalStrength(int rssi) {
+  if (rssi > -50) return "Excellent";
+  else if (rssi > -65) return "Good";
+  else if (rssi > -80) return "Fair";
+  else return "Poor";
+}
+
+String getSecurityType(bool isOpen) {
+  return isOpen ? "Open" : "WPA2";
+}
+
+String getCurrentTime() {
+  String tzAbbr = getTimezoneAbbreviation(timezoneOffset);
+  
+  if (rtcInitialized) {
+    DateTime now = rtc.now();
+    char timeBuffer[25];
+    sprintf(timeBuffer, "%02d/%02d/%04d %02d:%02d:%02d %s",
+            now.day(), now.month(), now.year(),
+            now.hour(), now.minute(), now.second(), tzAbbr.c_str());
+    return String(timeBuffer);
+  } else {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char timeBuffer[25];
+      sprintf(timeBuffer, "%02d/%02d/%04d %02d:%02d:%02d %s",
+              timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, tzAbbr.c_str());
+      return String(timeBuffer);
+    }
+    return "Time not available";
+  }
+}
+
+void debugPrint(const String& message) {
+  Serial.print("[DEBUG] ");
+  Serial.print(message);
+}
+
+void debugPrintln(const String& message) {
+  Serial.print("[DEBUG] ");
+  Serial.println(message);
+}
